@@ -1,20 +1,47 @@
 import { exec } from "child_process";
 import { promisify } from "util";
+import { readFileSync } from "fs";
 import { NextResponse } from "next/server";
 import type { DashboardData, AgentConfig, SessionInfo, GatewayStatus, ChannelHealth, SecurityFinding } from "@/lib/types";
 
 const execAsync = promisify(exec);
 
-const AGENT_META: Record<string, { role: string; modelShort: string }> = {
-  madaga: { role: "CEO / Orchestrator", modelShort: "Opus" },
-  gary: { role: "Marketing", modelShort: "Sonnet" },
-  steven: { role: "Dev", modelShort: "Opus" },
-  samantha: { role: "Ops", modelShort: "Haiku" },
-  juliano: { role: "Ventas", modelShort: "Sonnet" },
+const AGENT_ROLES: Record<string, string> = {
+  madaga:   "CEO / Orchestrator",
+  gary:     "Marketing",
+  steven:   "Dev",
+  samantha: "Ops",
+  juliano:  "Ventas",
 };
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
+
+function getModelShort(modelStr: string): string {
+  if (!modelStr) return "?";
+  if (modelStr.includes("opus"))   return "Opus";
+  if (modelStr.includes("sonnet")) return "Sonnet";
+  if (modelStr.includes("haiku"))  return "Haiku";
+  return modelStr.split("/").pop()?.split("-")[0] || "?";
+}
+
+/** Read configured models per agent from openclaw.json */
+function readAgentModels(): Record<string, string> {
+  const models: Record<string, string> = {};
+  try {
+    const raw = readFileSync(`${process.env.HOME}/.openclaw/openclaw.json`, "utf8");
+    const cfg = JSON.parse(raw);
+    const defaultModel =
+      cfg?.agents?.defaults?.model?.primary ||
+      cfg?.agents?.defaults?.model ||
+      "claude-sonnet-4-6";
+    const list: any[] = cfg?.agents?.list || [];
+    list.forEach((a: any) => {
+      models[a.id] = a.model || defaultModel;
+    });
+  } catch {}
+  return models;
+}
 
 export async function GET() {
   try {
@@ -23,16 +50,15 @@ export async function GET() {
       execAsync("openclaw health --json", { timeout: 15000 }),
     ]);
 
-    const statusRaw =
-      statusResult.status === "fulfilled" ? statusResult.value.stdout : "{}";
-    const healthRaw =
-      healthResult.status === "fulfilled" ? healthResult.value.stdout : "{}";
+    const statusRaw = statusResult.status === "fulfilled" ? statusResult.value.stdout : "{}";
+    const healthRaw  = healthResult.status  === "fulfilled" ? healthResult.value.stdout  : "{}";
 
     let status: any = {};
-    let health: any = {};
-
+    let health:  any = {};
     try { status = JSON.parse(statusRaw); } catch {}
-    try { health = JSON.parse(healthRaw); } catch {}
+    try { health  = JSON.parse(healthRaw);  } catch {}
+
+    const configuredModels = readAgentModels();
 
     // ── Agents ──────────────────────────────────────────────────────────────
     const heartbeatMap: Record<string, { enabled: boolean; every: string }> = {};
@@ -40,19 +66,32 @@ export async function GET() {
       heartbeatMap[a.agentId] = { enabled: a.enabled, every: a.every };
     });
 
+    // Group sessions by agent for quick lookup
+    const sessionsByAgent: Record<string, any[]> = {};
+    (status.sessions?.recent || []).forEach((s: any) => {
+      if (!sessionsByAgent[s.agentId]) sessionsByAgent[s.agentId] = [];
+      sessionsByAgent[s.agentId].push(s);
+    });
+
     const agents: AgentConfig[] = (status.agents?.agents || []).map((a: any) => {
       const hb = heartbeatMap[a.id] || { enabled: false, every: "disabled" };
-      const sessionData = (status.sessions?.recent || []).find(
-        (s: any) => s.agentId === a.id
-      );
-      const isOnline = a.lastActiveAgeMs !== null && a.lastActiveAgeMs < 300_000; // < 5 min
-      const meta = AGENT_META[a.id] || { role: "Agente", modelShort: "?" };
+      const agentSessions = sessionsByAgent[a.id] || [];
+
+      // Pick the most recently active session
+      const mainSession = agentSessions.sort(
+        (x: any, y: any) => (y.updatedAt || 0) - (x.updatedAt || 0)
+      )[0];
+
+      // Model: prefer configured model, fall back to session model
+      const actualModel = configuredModels[a.id] || mainSession?.model || "claude-sonnet-4-6";
+      const isOnline = a.lastActiveAgeMs !== null && a.lastActiveAgeMs < 300_000;
+
       return {
         id: a.id,
         name: a.name,
-        role: meta.role,
-        model: sessionData?.model || "claude-sonnet-4-6",
-        modelShort: meta.modelShort,
+        role: AGENT_ROLES[a.id] || "Agente",
+        model: actualModel,
+        modelShort: getModelShort(actualModel),
         workspaceDir: a.workspaceDir,
         sessionsCount: a.sessionsCount,
         lastUpdatedAt: a.lastUpdatedAt,
@@ -97,7 +136,6 @@ export async function GET() {
       host: gw.self?.host || "unknown",
       ip: gw.self?.ip || "unknown",
       serviceRunning: gwService.runtimeShort?.includes("running") ?? false,
-      servicePid: undefined,
     };
 
     // ── Channels ──────────────────────────────────────────────────────────────
@@ -116,14 +154,14 @@ export async function GET() {
     }
 
     // ── Security ──────────────────────────────────────────────────────────────
-    const securityFindings: SecurityFinding[] = (
-      status.securityAudit?.findings || []
-    ).map((f: any) => ({
-      checkId: f.checkId,
-      severity: f.severity,
-      title: f.title,
-      detail: f.detail,
-    }));
+    const securityFindings: SecurityFinding[] = (status.securityAudit?.findings || []).map(
+      (f: any) => ({
+        checkId: f.checkId,
+        severity: f.severity,
+        title: f.title,
+        detail: f.detail,
+      })
+    );
 
     const data: DashboardData = {
       agents,

@@ -28,7 +28,9 @@ interface Props {
 
 export function AgentStatusPanel({ agents, sessions }: Props) {
   const getAgentSessions = (agentId: string) =>
-    sessions.filter((s) => s.agentId === agentId);
+    sessions
+      .filter((s) => s.agentId === agentId)
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 
   const onlineCount = agents.filter((a) => a.online).length;
 
@@ -46,9 +48,8 @@ export function AgentStatusPanel({ agents, sessions }: Props) {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
         {agents.map((agent) => {
           const agentSessions = getAgentSessions(agent.id);
-          const mainSession = agentSessions.find(
-            (s) => s.key.includes("discord") || s.kind === "group"
-          ) || agentSessions[0];
+          // Use the most recently active session (already sorted by updatedAt desc)
+          const mainSession = agentSessions[0];
           const cost = mainSession
             ? estimateCost(
                 mainSession.model,
