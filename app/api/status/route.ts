@@ -1,6 +1,7 @@
 import { exec } from "child_process";
 import { promisify } from "util";
-import { readFileSync } from "fs";
+import { readFileSync, existsSync, statSync, readdirSync } from "fs";
+import { join } from "path";
 import { NextResponse } from "next/server";
 import type { DashboardData, AgentConfig, SessionInfo, GatewayStatus, ChannelHealth, SecurityFinding } from "@/lib/types";
 
@@ -17,6 +18,8 @@ const AGENT_ROLES: Record<string, string> = {
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
+const HOME = process.env.HOME || "/Users/tonystark";
+
 function getModelShort(modelStr: string): string {
   if (!modelStr) return "?";
   if (modelStr.includes("opus"))   return "Opus";
@@ -25,40 +28,136 @@ function getModelShort(modelStr: string): string {
   return modelStr.split("/").pop()?.split("-")[0] || "?";
 }
 
-/** Read configured models per agent from openclaw.json */
-function readAgentModels(): Record<string, string> {
-  const models: Record<string, string> = {};
+interface OpenClawConfig {
+  agents: { id: string; name: string; model?: string; workspace?: string }[];
+  defaultModel: string;
+}
+
+/** Read agent list + models directly from openclaw.json */
+function readConfig(): OpenClawConfig {
+  const result: OpenClawConfig = { agents: [], defaultModel: "anthropic/claude-sonnet-4-6" };
   try {
-    const raw = readFileSync(`${process.env.HOME}/.openclaw/openclaw.json`, "utf8");
+    const raw = readFileSync(`${HOME}/.openclaw/openclaw.json`, "utf8");
     const cfg = JSON.parse(raw);
-    const defaultModel =
+    result.defaultModel =
       cfg?.agents?.defaults?.model?.primary ||
       cfg?.agents?.defaults?.model ||
-      "claude-sonnet-4-6";
-    const list: any[] = cfg?.agents?.list || [];
-    list.forEach((a: any) => {
-      models[a.id] = a.model || defaultModel;
-    });
+      "anthropic/claude-sonnet-4-6";
+    result.agents = (cfg?.agents?.list || []).map((a: any) => ({
+      id: a.id,
+      name: a.name,
+      model: a.model || result.defaultModel,
+      workspace: a.workspace,
+    }));
   } catch {}
-  return models;
+  return result;
+}
+
+interface DiskSession {
+  key: string;
+  sessionId: string;
+  updatedAt: number;
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheRead: number;
+  cacheWrite: number;
+  contextTokens: number;
+  sessionFile?: string;
+  model?: string;
+  displayName?: string;
+  channel?: string;
+  groupChannel?: string;
+}
+
+/** Read sessions for one agent directly from disk */
+function readAgentSessions(agentId: string): DiskSession[] {
+  const sessionsPath = `${HOME}/.openclaw/agents/${agentId}/sessions/sessions.json`;
+  if (!existsSync(sessionsPath)) return [];
+  try {
+    const raw = readFileSync(sessionsPath, "utf8");
+    const data = JSON.parse(raw);
+    return Object.entries(data).map(([key, v]: [string, any]) => ({
+      key,
+      sessionId: v.sessionId || "",
+      updatedAt: v.updatedAt || 0,
+      totalTokens: v.totalTokens || 0,
+      inputTokens: v.inputTokens || 0,
+      outputTokens: v.outputTokens || 0,
+      cacheRead: v.cacheRead || 0,
+      cacheWrite: v.cacheWrite || 0,
+      contextTokens: v.contextTokens || 200000,
+      sessionFile: v.sessionFile || undefined,
+      model: v.model || undefined,
+      displayName: v.displayName || key,
+      channel: v.channel || undefined,
+      groupChannel: v.groupChannel || undefined,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/** Get directory size in MB (non-recursive into node_modules/.git for speed) */
+function getDirSizeMB(dirPath: string): number | null {
+  if (!dirPath || !existsSync(dirPath)) return null;
+  try {
+    let total = 0;
+    const walk = (dir: string, depth: number) => {
+      if (depth > 6) return;
+      const entries = readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name === "node_modules" || entry.name === ".git") continue;
+        const full = join(dir, entry.name);
+        try {
+          if (entry.isFile()) total += statSync(full).size;
+          else if (entry.isDirectory()) walk(full, depth + 1);
+        } catch {}
+      }
+    };
+    walk(dirPath, 0);
+    return Math.round((total / 1024 / 1024) * 10) / 10;
+  } catch { return null; }
+}
+
+/** Count lines in a JSONL file */
+function countJsonlLines(filePath: string): number {
+  if (!filePath || !existsSync(filePath)) return 0;
+  try {
+    const content = readFileSync(filePath, "utf8");
+    return content.split("\n").filter((l) => l.trim().length > 0).length;
+  } catch {
+    return 0;
+  }
 }
 
 export async function GET() {
   try {
+    // Read agents + models from disk (instant)
+    const config = readConfig();
+
+    // Read all sessions from disk (instant)
+    const allDiskSessions: (DiskSession & { agentId: string })[] = [];
+    for (const agent of config.agents) {
+      const agentSessions = readAgentSessions(agent.id);
+      for (const s of agentSessions) {
+        allDiskSessions.push({ ...s, agentId: agent.id });
+      }
+    }
+
+    // Only call openclaw status for gateway/security/channels (not sessions)
     const [statusResult, healthResult] = await Promise.allSettled([
       execAsync("openclaw status --json", { timeout: 10000 }),
       execAsync("openclaw health --json", { timeout: 15000 }),
     ]);
 
     const statusRaw = statusResult.status === "fulfilled" ? statusResult.value.stdout : "{}";
-    const healthRaw  = healthResult.status  === "fulfilled" ? healthResult.value.stdout  : "{}";
+    const healthRaw = healthResult.status === "fulfilled" ? healthResult.value.stdout : "{}";
 
     let status: any = {};
-    let health:  any = {};
+    let health: any = {};
     try { status = JSON.parse(statusRaw); } catch {}
-    try { health  = JSON.parse(healthRaw);  } catch {}
-
-    const configuredModels = readAgentModels();
+    try { health = JSON.parse(healthRaw); } catch {}
 
     // ── Agents ──────────────────────────────────────────────────────────────
     const heartbeatMap: Record<string, { enabled: boolean; every: string }> = {};
@@ -66,62 +165,80 @@ export async function GET() {
       heartbeatMap[a.agentId] = { enabled: a.enabled, every: a.every };
     });
 
-    // Group sessions by agent for quick lookup
-    const sessionsByAgent: Record<string, any[]> = {};
-    (status.sessions?.recent || []).forEach((s: any) => {
+    // Group disk sessions by agent
+    const sessionsByAgent: Record<string, (DiskSession & { agentId: string })[]> = {};
+    for (const s of allDiskSessions) {
       if (!sessionsByAgent[s.agentId]) sessionsByAgent[s.agentId] = [];
       sessionsByAgent[s.agentId].push(s);
+    }
+
+    // Use status.agents for lastActiveAgeMs/lastUpdatedAt (lightweight metadata)
+    const statusAgentMap: Record<string, any> = {};
+    (status.agents?.agents || []).forEach((a: any) => {
+      statusAgentMap[a.id] = a;
     });
 
-    const agents: AgentConfig[] = (status.agents?.agents || []).map((a: any) => {
+    const agents: AgentConfig[] = config.agents.map((a) => {
       const hb = heartbeatMap[a.id] || { enabled: false, every: "disabled" };
       const agentSessions = sessionsByAgent[a.id] || [];
+      const statusAgent = statusAgentMap[a.id] || {};
 
-      // Pick the most recently active session
-      const mainSession = agentSessions.sort(
-        (x: any, y: any) => (y.updatedAt || 0) - (x.updatedAt || 0)
-      )[0];
-
-      // Model: prefer configured model, fall back to session model
-      const actualModel = configuredModels[a.id] || mainSession?.model || "claude-sonnet-4-6";
-      const isOnline = a.lastActiveAgeMs !== null && a.lastActiveAgeMs < 300_000;
+      const isOnline = statusAgent.lastActiveAgeMs !== undefined &&
+        statusAgent.lastActiveAgeMs !== null &&
+        statusAgent.lastActiveAgeMs < 300_000;
 
       return {
         id: a.id,
         name: a.name,
         role: AGENT_ROLES[a.id] || "Agente",
-        model: actualModel,
-        modelShort: getModelShort(actualModel),
-        workspaceDir: a.workspaceDir,
-        sessionsCount: a.sessionsCount,
-        lastUpdatedAt: a.lastUpdatedAt,
-        lastActiveAgeMs: a.lastActiveAgeMs,
+        model: a.model,
+        modelShort: getModelShort(a.model || config.defaultModel),
+        workspaceDir: a.workspace || "",
+        workspaceSizeMB: getDirSizeMB(a.workspace || ""),
+        sessionsCount: agentSessions.length,
+        lastUpdatedAt: statusAgent.lastUpdatedAt || 0,
+        lastActiveAgeMs: statusAgent.lastActiveAgeMs ?? null,
         online: isOnline,
         heartbeatEnabled: hb.enabled,
         heartbeatEvery: hb.every,
       } as AgentConfig;
     });
 
-    // ── Sessions ─────────────────────────────────────────────────────────────
-    const sessions: SessionInfo[] = (status.sessions?.recent || []).map((s: any) => ({
-      key: s.key,
-      agentId: s.agentId,
-      kind: s.kind,
-      sessionId: s.sessionId,
-      updatedAt: s.updatedAt,
-      age: s.age || 0,
-      model: s.model || "claude-sonnet-4-6",
-      contextTokens: s.contextTokens || 200000,
-      inputTokens: s.inputTokens || 0,
-      outputTokens: s.outputTokens || 0,
-      cacheRead: s.cacheRead || 0,
-      cacheWrite: s.cacheWrite || 0,
-      totalTokens: s.totalTokens || 0,
-      remainingTokens: s.remainingTokens || 200000,
-      percentUsed: s.percentUsed || 0,
-      channel: s.key.includes("discord") ? "discord" : s.kind === "direct" ? "direct" : "other",
-      displayName: s.key,
-    }));
+    // ── Sessions (from disk) ─────────────────────────────────────────────────
+    const sessions: SessionInfo[] = allDiskSessions.map((s) => {
+      const totalTokens = s.totalTokens;
+      const contextTokens = s.contextTokens || 200000;
+      const percentUsed = Math.round((totalTokens / contextTokens) * 100);
+      const messageCount = countJsonlLines(s.sessionFile || "");
+
+      // Derive channel type from session key
+      const channel = s.key.includes(":discord:") ? "discord"
+        : s.key.includes(":cron:") ? "cron"
+        : s.key.endsWith(":main") ? "main"
+        : "other";
+
+      return {
+        key: s.key,
+        agentId: s.agentId,
+        kind: channel === "discord" ? "channel" : channel,
+        sessionId: s.sessionId,
+        updatedAt: s.updatedAt,
+        age: s.updatedAt ? Date.now() - s.updatedAt : 0,
+        model: s.model || config.defaultModel,
+        contextTokens,
+        inputTokens: s.inputTokens,
+        outputTokens: s.outputTokens,
+        cacheRead: s.cacheRead,
+        cacheWrite: s.cacheWrite,
+        totalTokens,
+        remainingTokens: contextTokens - totalTokens,
+        percentUsed,
+        channel,
+        displayName: s.displayName || s.key,
+        messageCount,
+        sessionFile: s.sessionFile,
+      };
+    });
 
     // ── Gateway ───────────────────────────────────────────────────────────────
     const gw = status.gateway || {};

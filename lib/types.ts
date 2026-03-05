@@ -5,6 +5,7 @@ export interface AgentConfig {
   model: string;
   modelShort: string;
   workspaceDir: string;
+  workspaceSizeMB: number | null;
   sessionsCount: number;
   lastUpdatedAt: number | null;
   lastActiveAgeMs: number | null;
@@ -31,6 +32,9 @@ export interface SessionInfo {
   percentUsed: number;
   channel: string;
   displayName: string;
+  messageCount?: number;
+  sessionFile?: string;
+  isFresh?: boolean;
 }
 
 export interface GatewayStatus {

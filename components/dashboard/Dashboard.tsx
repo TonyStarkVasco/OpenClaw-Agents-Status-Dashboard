@@ -9,7 +9,7 @@ import { SystemPanel } from "./SystemPanel";
 import type { DashboardData } from "@/lib/types";
 import { RefreshCw, Wifi, WifiOff, Bot } from "lucide-react";
 
-const REFRESH_INTERVAL_MS = 30_000; // 30 seconds
+const REFRESH_INTERVAL_MS = 15_000; // 15 seconds
 
 export function Dashboard() {
   const [data, setData] = useState<DashboardData | null>(null);
@@ -169,7 +169,7 @@ export function Dashboard() {
       <footer className="border-t border-white/5 mt-8">
         <div className="max-w-[1600px] mx-auto px-4 sm:px-6 py-4 flex items-center justify-between text-[11px] text-zinc-600">
           <span>Horizzon Labs Control Panel · OpenClaw {data?.gateway.version || ""}</span>
-          <span>Auto-refresh cada 30s · {lastRefresh ? `Últ. actualización: ${formatTime(lastRefresh)}` : ""}</span>
+          <span>Auto-refresh cada 15s · {lastRefresh ? `Últ. actualización: ${formatTime(lastRefresh)}` : ""}</span>
         </div>
       </footer>
     </div>
